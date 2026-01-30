@@ -159,41 +159,7 @@ export async function startGatewayServer(
     description: "raw stream log path override",
   });
 
-  let configSnapshot = await readConfigFileSnapshot();
-  if (configSnapshot.legacyIssues.length > 0) {
-    if (isNixMode) {
-      throw new Error(
-        "Legacy config entries detected while running in Nix mode. Update your Nix config to the latest schema and restart.",
-      );
-    }
-    const { config: migrated, changes } = migrateLegacyConfig(configSnapshot.parsed);
-    if (!migrated) {
-      throw new Error(
-        `Legacy config entries detected but auto-migration failed. Run "${formatCliCommand("openclaw doctor")}" to migrate.`,
-      );
-    }
-    await writeConfigFile(migrated);
-    if (changes.length > 0) {
-      log.info(
-        `gateway: migrated legacy config entries:\n${changes
-          .map((entry) => `- ${entry}`)
-          .join("\n")}`,
-      );
-    }
-  }
-
-  configSnapshot = await readConfigFileSnapshot();
-  if (configSnapshot.exists && !configSnapshot.valid) {
-    const issues =
-      configSnapshot.issues.length > 0
-        ? configSnapshot.issues
-            .map((issue) => `${issue.path || "<root>"}: ${issue.message}`)
-            .join("\n")
-        : "Unknown validation issue.";
-    throw new Error(
-      `Invalid config at ${configSnapshot.path}.\n${issues}\nRun "${formatCliCommand("openclaw doctor")}" to repair, then retry.`,
-    );
-  }
+  const configSnapshot = await loadAndMigrateConfig();
 
   const autoEnable = applyPluginAutoEnable({ config: configSnapshot.config, env: process.env });
   if (autoEnable.changes.length > 0) {
@@ -215,25 +181,14 @@ export async function startGatewayServer(
     startDiagnosticHeartbeat();
   }
   setGatewaySigusr1RestartPolicy({ allowExternal: cfgAtStart.commands?.restart === true });
-  initSubagentRegistry();
-  const defaultAgentId = resolveDefaultAgentId(cfgAtStart);
-  const defaultWorkspaceDir = resolveAgentWorkspaceDir(cfgAtStart, defaultAgentId);
-  const baseMethods = listGatewayMethods();
-  const { pluginRegistry, gatewayMethods: baseGatewayMethods } = loadGatewayPlugins({
-    cfg: cfgAtStart,
-    workspaceDir: defaultWorkspaceDir,
-    log,
-    coreGatewayHandlers,
-    baseMethods,
-  });
-  const channelLogs = Object.fromEntries(
-    listChannelPlugins().map((plugin) => [plugin.id, logChannels.child(plugin.id)]),
-  ) as Record<ChannelId, ReturnType<typeof createSubsystemLogger>>;
-  const channelRuntimeEnvs = Object.fromEntries(
-    Object.entries(channelLogs).map(([id, logger]) => [id, runtimeForLogger(logger)]),
-  ) as Record<ChannelId, RuntimeEnv>;
-  const channelMethods = listChannelPlugins().flatMap((plugin) => plugin.gatewayMethods ?? []);
-  const gatewayMethods = Array.from(new Set([...baseGatewayMethods, ...channelMethods]));
+  const {
+    defaultWorkspaceDir,
+    pluginRegistry,
+    channelLogs,
+    channelRuntimeEnvs,
+    gatewayMethods,
+  } = initializeGatewayPlugins(cfgAtStart);
+
   let pluginServices: PluginServicesHandle | null = null;
   const runtimeConfig = await resolveGatewayRuntimeConfig({
     cfg: cfgAtStart,
@@ -269,7 +224,8 @@ export async function startGatewayServer(
   if (cfgAtStart.gateway?.tls?.enabled && !gatewayTls.enabled) {
     throw new Error(gatewayTls.error ?? "gateway tls: failed to enable");
   }
-  const {
+  /* eslint-disable-next-line prefer-const */
+  let {
     canvasHost,
     httpServer,
     httpServers,
@@ -285,27 +241,23 @@ export async function startGatewayServer(
     addChatRun,
     removeChatRun,
     chatAbortControllers,
-  } = await createGatewayRuntimeState({
-    cfg: cfgAtStart,
-    bindHost,
+  } = await initializeRuntimeState({
+    cfgAtStart,
     port,
+    bindHost,
     controlUiEnabled,
     controlUiBasePath,
     openAiChatCompletionsEnabled,
     openResponsesEnabled,
     openResponsesConfig,
+    hooksConfig,
     resolvedAuth,
     gatewayTls,
-    hooksConfig: () => hooksConfig,
     pluginRegistry,
     deps,
     canvasRuntime,
     canvasHostEnabled,
     allowCanvasHostInTests: opts.allowCanvasHostInTests,
-    logCanvas,
-    log,
-    logHooks,
-    logPlugins,
   });
   let bonjourStop: (() => Promise<void>) | null = null;
   const nodeRegistry = new NodeRegistry();
@@ -582,5 +534,116 @@ export async function startGatewayServer(
       skillsChangeUnsub();
       await close(opts);
     },
+  };
+}
+
+async function loadAndMigrateConfig() {
+  let configSnapshot = await readConfigFileSnapshot();
+  if (configSnapshot.legacyIssues.length > 0) {
+    if (isNixMode) {
+      throw new Error(
+        "Legacy config entries detected while running in Nix mode. Update your Nix config to the latest schema and restart.",
+      );
+    }
+    const { config: migrated, changes } = migrateLegacyConfig(configSnapshot.parsed);
+    if (!migrated) {
+      throw new Error(
+        `Legacy config entries detected but auto-migration failed. Run "${formatCliCommand("openclaw doctor")}" to migrate.`,
+      );
+    }
+    await writeConfigFile(migrated);
+    if (changes.length > 0) {
+      log.info(
+        `gateway: migrated legacy config entries:\n${changes
+          .map((entry) => `- ${entry}`)
+          .join("\n")}`,
+      );
+    }
+  }
+
+  configSnapshot = await readConfigFileSnapshot();
+  if (configSnapshot.exists && !configSnapshot.valid) {
+    const issues =
+      configSnapshot.issues.length > 0
+        ? configSnapshot.issues
+          .map((issue) => `${issue.path || "<root>"}: ${issue.message}`)
+          .join("\n")
+        : "Unknown validation issue.";
+    throw new Error(
+      `Invalid config at ${configSnapshot.path}.\n${issues}\nRun "${formatCliCommand("openclaw doctor")}" to repair, then retry.`,
+    );
+  }
+  return configSnapshot;
+}
+
+async function initializeRuntimeState(opts: {
+  cfgAtStart: any;
+  port: number;
+  bindHost: string | undefined;
+  controlUiEnabled: boolean;
+  controlUiBasePath: string | undefined;
+  openAiChatCompletionsEnabled: boolean;
+  openResponsesEnabled: boolean;
+  openResponsesConfig: any;
+  hooksConfig: any;
+  resolvedAuth: any;
+  gatewayTls: any;
+  pluginRegistry: any;
+  deps: any;
+  canvasRuntime: any;
+  canvasHostEnabled: boolean;
+  allowCanvasHostInTests?: boolean;
+}) {
+  return createGatewayRuntimeState({
+    cfg: opts.cfgAtStart,
+    bindHost: opts.bindHost,
+    port: opts.port,
+    controlUiEnabled: opts.controlUiEnabled,
+    controlUiBasePath: opts.controlUiBasePath,
+    openAiChatCompletionsEnabled: opts.openAiChatCompletionsEnabled,
+    openResponsesEnabled: opts.openResponsesEnabled,
+    openResponsesConfig: opts.openResponsesConfig,
+    resolvedAuth: opts.resolvedAuth,
+    gatewayTls: opts.gatewayTls,
+    hooksConfig: () => opts.hooksConfig,
+    pluginRegistry: opts.pluginRegistry,
+    deps: opts.deps,
+    canvasRuntime: opts.canvasRuntime,
+    canvasHostEnabled: opts.canvasHostEnabled,
+    allowCanvasHostInTests: opts.allowCanvasHostInTests,
+    logCanvas,
+    log,
+    logHooks,
+    logPlugins,
+  });
+}
+
+function initializeGatewayPlugins(cfgAtStart: any) {
+  initSubagentRegistry();
+  const defaultAgentId = resolveDefaultAgentId(cfgAtStart);
+  const defaultWorkspaceDir = resolveAgentWorkspaceDir(cfgAtStart, defaultAgentId);
+  const baseMethods = listGatewayMethods();
+  const { pluginRegistry, gatewayMethods: baseGatewayMethods } = loadGatewayPlugins({
+    cfg: cfgAtStart,
+    workspaceDir: defaultWorkspaceDir,
+    log,
+    coreGatewayHandlers,
+    baseMethods,
+  });
+  const channelLogs = Object.fromEntries(
+    listChannelPlugins().map((plugin) => [plugin.id, logChannels.child(plugin.id)]),
+  ) as Record<ChannelId, ReturnType<typeof createSubsystemLogger>>;
+  const channelRuntimeEnvs = Object.fromEntries(
+    Object.entries(channelLogs).map(([id, logger]) => [id, runtimeForLogger(logger)]),
+  ) as Record<ChannelId, RuntimeEnv>;
+  const channelMethods = listChannelPlugins().flatMap((plugin) => plugin.gatewayMethods ?? []);
+  const gatewayMethods = Array.from(new Set([...baseGatewayMethods, ...channelMethods]));
+
+  return {
+    defaultWorkspaceDir,
+    pluginRegistry,
+    channelLogs,
+    channelRuntimeEnvs,
+    gatewayMethods,
   };
 }

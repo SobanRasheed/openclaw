@@ -32,7 +32,8 @@ import { formatUncaughtError } from "./infra/errors.js";
 import { installUnhandledRejectionHandler } from "./infra/unhandled-rejections.js";
 import { enableConsoleCapture } from "./logging.js";
 import { runCommandWithTimeout, runExec } from "./process/exec.js";
-import { assertWebChannel, normalizeE164, toWhatsappJid } from "./utils.js";
+import { assertWebChannel } from "./utils.js";
+import { normalizeE164, toWhatsappJid } from "./whatsapp/utils.js";
 
 loadDotEnv({ quiet: true });
 normalizeEnv();
